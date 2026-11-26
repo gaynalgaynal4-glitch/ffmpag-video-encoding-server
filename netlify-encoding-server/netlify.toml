@@ -1,0 +1,7 @@
+[build]
+  publish = "public"
+
+[server]
+  size = "small"
+  [server.scale]
+    max = 1
