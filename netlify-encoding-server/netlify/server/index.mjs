@@ -18,7 +18,7 @@ const MAX_JOB_MS = Number(process.env.MAX_JOB_MS || 25 * 60 * 1000);
 const API_KEY = process.env.ENCODING_API_KEY || '';
 const REDIS_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/$/, '');
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
-const KEY_PREFIX = process.env.QUEUE_KEY_PREFIX || '';
+const KEY_PREFIX = process.env.QUEUE_KEY_PREFIX || 'jv-methods:encoding-queue:v1';
 const ACTIVE_KEY = `${KEY_PREFIX}:active`;
 const WAITING_KEY = `${KEY_PREFIX}:waiting`;
 
@@ -129,7 +129,7 @@ function ffmpegArgs(inputUrl, p, opts = {}) {
   if (p.kind === 'alpha') {
     const vb = safeBitrate(opts.videoBitrate, p.videoBitrate);
     const ab = safeBitrate(opts.audioBitrate, p.audioBitrate);
-    const args = ['-hide_banner', '-loglevel', 'error', '-nostdin'];
+    const args = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-nostats', '-progress', 'pipe:3'];
     if (opts.itsScale) args.push('-itsscale', opts.itsScale); // must come before -i
     args.push(
       '-i', inputUrl,
@@ -153,6 +153,19 @@ function ffmpegArgs(inputUrl, p, opts = {}) {
     '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
     '-f', 'mp4', 'pipe:1'
   ];
+}
+
+const PROGRESS_PREFIX = `${KEY_PREFIX}:progress`;
+
+async function setProgress(jobToken, data) {
+  try {
+    await redisCommand('SET', `${PROGRESS_PREFIX}:${jobToken}`, JSON.stringify({ ...data, updatedAt: Date.now() }), 'EX', '3600');
+  } catch (error) { console.error('Progress write failed:', error.message); }
+}
+
+async function getProgress(jobToken) {
+  const raw = await redisCommand('GET', `${PROGRESS_PREFIX}:${jobToken}`);
+  return raw ? JSON.parse(raw) : null;
 }
 
 async function admitQueue(jobToken) {
@@ -243,7 +256,27 @@ function createEncodingStream(inputUrl, preset, jobToken, admissionState, reques
           heartbeat.unref?.();
           jobTimer = setTimeout(abortJob, Math.max(1, requestDeadline - Date.now()));
 
-          child = spawn(ffmpegPath, ffmpegArgs(inputUrl, preset, opts), { stdio: ['ignore', 'pipe', 'pipe'] });
+          child = spawn(ffmpegPath, ffmpegArgs(inputUrl, preset, opts), { stdio: ['ignore', 'pipe', 'pipe', 'pipe'] });
+          if (preset.kind === 'alpha') {
+            let buf = '';
+            let lastWrite = 0;
+            void setProgress(jobToken, { state: 'encoding', percent: 0 });
+            child.stdio[3].setEncoding('utf8');
+            child.stdio[3].on('data', chunk => {
+              buf += chunk;
+              const lines = buf.split('\n');
+              buf = lines.pop();
+              for (const line of lines) {
+                const m = line.match(/^out_time_(?:us|ms)=(\d+)/);
+                if (!m || !opts.durationSec) continue;
+                const now = Date.now();
+                if (now - lastWrite < 1500) continue;
+                lastWrite = now;
+                const percent = Math.max(0, Math.min(99, Math.round((Number(m[1]) / 1e6 / opts.durationSec) * 100)));
+                void setProgress(jobToken, { state: 'encoding', percent });
+              }
+            });
+          }
           child.stderr.setEncoding('utf8');
           child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-12000); });
           child.stdout.on('data', chunk => {
@@ -255,6 +288,7 @@ function createEncodingStream(inputUrl, preset, jobToken, admissionState, reques
             try { controller.error(error); } catch {}
           });
           child.on('close', async code => {
+            if (preset.kind === 'alpha') await setProgress(jobToken, code === 0 && !cancelled ? { state: 'done', percent: 100 } : { state: 'failed', percent: 0 });
             await cleanup();
             if (code === 0 && !cancelled) controller.close();
             else {
@@ -289,12 +323,19 @@ export default async function handler(req) {
     try { return json({ ...await queueStatus(), maxActive: 1, maxWaiting: MAX_WAITING, maxTotal: MAX_WAITING + 1 }); }
     catch (error) { return json({ error: error.message }, 503); }
   }
+  const pm = url.pathname.match(/^\/v1\/progress\/([0-9a-fA-F-]{36})$/);
+  if (req.method === 'GET' && pm) {
+    try {
+      const data = await getProgress(pm[1]);
+      return data ? json(data) : json({ error: 'Unknown or expired job.' }, 404);
+    } catch (error) { return json({ error: error.message }, 503); }
+  }
   if (url.pathname !== '/v1/encode' || req.method !== 'POST') return json({ error: 'Not found' }, 404);
   if (!ffmpegPath) return json({ error: 'FFmpeg binary is unavailable in this deployment.' }, 500);
 
   let body;
   try { body = await req.json(); } catch { return json({ error: 'Request body must be valid JSON.' }, 400); }
-  const { inputUrl, presetId, itsScale, videoBitrate, audioBitrate } = body || {};
+  const { inputUrl, presetId, itsScale, videoBitrate, audioBitrate, durationSec } = body || {};
   if (typeof inputUrl !== 'string' || !isPublicHttpsUrl(inputUrl)) return json({ error: 'inputUrl must be a public HTTPS URL.' }, 400);
   const preset = PRESETS[presetId];
   if (!preset) return json({ error: 'Unknown presetId.', availablePresets: Object.keys(PRESETS) }, 400);
@@ -309,9 +350,11 @@ export default async function handler(req) {
   if (admission.state === 'FULL') return json({ error: 'Encoding queue is full. One job is active and eight users are already waiting.', code: 'QUEUE_FULL', maxActive: 1, maxWaiting: MAX_WAITING }, 429, { 'retry-after': '30' });
 
   const stream = createEncodingStream(inputUrl, preset, jobToken, admission.state, req.signal, {
-    itsScale: safeItsScale(itsScale), videoBitrate, audioBitrate
+    itsScale: safeItsScale(itsScale), videoBitrate, audioBitrate,
+    durationSec: Number.isFinite(Number(durationSec)) && Number(durationSec) > 0 ? Number(durationSec) : 0
   });
   const isAlpha = preset.kind === 'alpha';
+  if (isAlpha) await setProgress(jobToken, { state: admission.state === 'WAIT' ? 'queued' : 'starting', percent: 0, position: admission.position });
 
   return new Response(stream, {
     status: 200,
