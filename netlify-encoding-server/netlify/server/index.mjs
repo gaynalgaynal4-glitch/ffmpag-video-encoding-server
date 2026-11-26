@@ -5,7 +5,9 @@ import ffmpegPath from 'ffmpeg-static';
 const PRESETS = Object.freeze({
   'h264-1080p-crf-0': { id: 'h264-1080p-crf-0', name: 'H.264 1080p Lossless', codec: 'libx264', crf: 0, height: 1080, preset: 'medium', audioBitrate: '192k' },
   'h264-1080p-crf-1': { id: 'h264-1080p-crf-1', name: 'H.264 1080p CRF 1', codec: 'libx264', crf: 1, height: 1080, preset: 'medium', audioBitrate: '192k' },
-  'h264-1080p-crf-2': { id: 'h264-1080p-crf-2', name: 'H.264 1080p CRF 2', codec: 'libx264', crf: 2, height: 1080, preset: 'medium', audioBitrate: '192k' }
+  'h264-1080p-crf-2': { id: 'h264-1080p-crf-2', name: 'H.264 1080p CRF 2', codec: 'libx264', crf: 2, height: 1080, preset: 'medium', audioBitrate: '192k' },
+  // Alpha method: WMV2/WMAV2 in ASF, 1080p, optional timestamp scaling (-itsscale) for FPS patching.
+  'alpha-wmv-1080p': { id: 'alpha-wmv-1080p', name: 'Alpha WMV2 1080p', codec: 'wmv2', kind: 'alpha', height: 1080, videoBitrate: '25M', audioBitrate: '128k', ext: 'wmv', mime: 'video/x-ms-wmv' }
 });
 
 // One encoder at a time, with at most eight additional requests waiting.
@@ -16,7 +18,7 @@ const MAX_JOB_MS = Number(process.env.MAX_JOB_MS || 25 * 60 * 1000);
 const API_KEY = process.env.ENCODING_API_KEY || '';
 const REDIS_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/$/, '');
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
-const KEY_PREFIX = process.env.QUEUE_KEY_PREFIX || '';
+const KEY_PREFIX = process.env.QUEUE_KEY_PREFIX || 'jv-methods:encoding-queue:v1';
 const ACTIVE_KEY = `${KEY_PREFIX}:active`;
 const WAITING_KEY = `${KEY_PREFIX}:waiting`;
 
@@ -107,7 +109,39 @@ function authOk(req) {
   return req.headers.get('authorization') === `Bearer ${API_KEY}` || req.headers.get('x-api-key') === API_KEY;
 }
 
-function ffmpegArgs(inputUrl, p) {
+function safeBitrate(value, fallback) {
+  const v = String(value ?? '').trim();
+  return /^\d{2,6}[kKmM]?$/.test(v) ? v : fallback;
+}
+
+function bitrateToBps(v) {
+  const m = String(v).match(/^(\d+)([kKmM]?)$/);
+  const n = Number(m[1]);
+  return m[2].toLowerCase() === 'm' ? n * 1e6 : m[2].toLowerCase() === 'k' ? n * 1e3 : n;
+}
+
+function safeItsScale(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0.1 && n <= 20 ? n.toFixed(10) : null;
+}
+
+function ffmpegArgs(inputUrl, p, opts = {}) {
+  if (p.kind === 'alpha') {
+    const vb = safeBitrate(opts.videoBitrate, p.videoBitrate);
+    const ab = safeBitrate(opts.audioBitrate, p.audioBitrate);
+    const args = ['-hide_banner', '-loglevel', 'error', '-nostdin'];
+    if (opts.itsScale) args.push('-itsscale', opts.itsScale); // must come before -i
+    args.push(
+      '-i', inputUrl,
+      '-map', '0:v:0', '-map', '0:a?',
+      '-vf', `scale=-2:${p.height}:flags=lanczos`,
+      '-c:v', p.codec, '-b:v', vb,
+      '-maxrate', String(bitrateToBps(vb)), '-bufsize', String(bitrateToBps(vb) * 2),
+      '-c:a', 'wmav2', '-b:a', ab,
+      '-f', 'asf', 'pipe:1'
+    );
+    return args;
+  }
   return [
     '-hide_banner', '-loglevel', 'error', '-nostdin',
     '-i', inputUrl,
@@ -155,7 +189,7 @@ async function waitForTurn(jobToken, signal, deadline) {
   throw new Error('QUEUE_WAIT_TIMEOUT');
 }
 
-function createEncodingStream(inputUrl, preset, jobToken, admissionState, requestSignal) {
+function createEncodingStream(inputUrl, preset, jobToken, admissionState, requestSignal, opts = {}) {
   let child = null;
   let stderr = '';
   let finished = false;
@@ -209,7 +243,7 @@ function createEncodingStream(inputUrl, preset, jobToken, admissionState, reques
           heartbeat.unref?.();
           jobTimer = setTimeout(abortJob, Math.max(1, requestDeadline - Date.now()));
 
-          child = spawn(ffmpegPath, ffmpegArgs(inputUrl, preset), { stdio: ['ignore', 'pipe', 'pipe'] });
+          child = spawn(ffmpegPath, ffmpegArgs(inputUrl, preset, opts), { stdio: ['ignore', 'pipe', 'pipe'] });
           child.stderr.setEncoding('utf8');
           child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-12000); });
           child.stdout.on('data', chunk => {
@@ -260,7 +294,7 @@ export default async function handler(req) {
 
   let body;
   try { body = await req.json(); } catch { return json({ error: 'Request body must be valid JSON.' }, 400); }
-  const { inputUrl, presetId } = body || {};
+  const { inputUrl, presetId, itsScale, videoBitrate, audioBitrate } = body || {};
   if (typeof inputUrl !== 'string' || !isPublicHttpsUrl(inputUrl)) return json({ error: 'inputUrl must be a public HTTPS URL.' }, 400);
   const preset = PRESETS[presetId];
   if (!preset) return json({ error: 'Unknown presetId.', availablePresets: Object.keys(PRESETS) }, 400);
@@ -274,18 +308,21 @@ export default async function handler(req) {
   }
   if (admission.state === 'FULL') return json({ error: 'Encoding queue is full. One job is active and eight users are already waiting.', code: 'QUEUE_FULL', maxActive: 1, maxWaiting: MAX_WAITING }, 429, { 'retry-after': '30' });
 
-  const stream = createEncodingStream(inputUrl, preset, jobToken, admission.state, req.signal);
+  const stream = createEncodingStream(inputUrl, preset, jobToken, admission.state, req.signal, {
+    itsScale: safeItsScale(itsScale), videoBitrate, audioBitrate
+  });
+  const isAlpha = preset.kind === 'alpha';
 
   return new Response(stream, {
     status: 200,
     headers: {
-      'content-type': 'video/mp4',
-      'content-disposition': `attachment; filename="${preset.id}.mp4"`,
+      'content-type': preset.mime || 'video/mp4',
+      'content-disposition': `attachment; filename="${preset.id}.${preset.ext || 'mp4'}"`,
       'cache-control': 'no-store, no-transform',
       'x-encoding-job-id': jobToken,
       'x-encoding-preset': preset.id,
-      'x-video-codec': 'h264',
-      'x-video-crf': String(preset.crf),
+      'x-video-codec': isAlpha ? 'wmv2' : 'h264',
+      ...(isAlpha ? {} : { 'x-video-crf': String(preset.crf) }),
       'x-video-height': String(preset.height),
       'x-queue-policy': '1-active-8-waiting',
       'x-queue-status': admission.state.toLowerCase(),
