@@ -16,7 +16,7 @@ const MAX_JOB_MS = Number(process.env.MAX_JOB_MS || 25 * 60 * 1000);
 const API_KEY = process.env.ENCODING_API_KEY || '';
 const REDIS_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/$/, '');
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
-const KEY_PREFIX = process.env.QUEUE_KEY_PREFIX || 'jv-methods:encoding-queue:v1';
+const KEY_PREFIX = process.env.QUEUE_KEY_PREFIX || '';
 const ACTIVE_KEY = `${KEY_PREFIX}:active`;
 const WAITING_KEY = `${KEY_PREFIX}:waiting`;
 
