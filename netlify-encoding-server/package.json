@@ -4,10 +4,7 @@
   "private": true,
   "type": "module",
   "engines": { "node": ">=24" },
-  "scripts": { "dev": "netlify dev", "deploy": "netlify deploy --prod" },
   "dependencies": {
-    "@netlify/server": "^1.0.0",
     "ffmpeg-static": "^5.2.0"
-  },
-  "devDependencies": { "netlify-cli": "^27.17.0" }
+  }
 }
